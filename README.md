@@ -4,7 +4,7 @@ A Blender add-on that adds a shelf to the Shader, Geometry Nodes, or Compositor 
 ## Features
 - **Nodes tab:** save any node as a favorite. Nodes with modes can be saved once per mode (for example Math: Power, Math: Subtract,  Mix: Overlay, Mix: Screen).
 - **Groups tab:** select several nodes and save them, with their connections, as a reusable group. Positions are not saved, and these are not native node groups.
-- 
+ 
 - **Add Selected Node(s) button:** one selected node goes to the Nodes tab. Several selected nodes open a dialog where you set a name, description, and color for the new group.
  
 - **Click to place:** click a favorite and it attaches to the cursor until you drop it in the graph, like Blender's own add-node menu.
