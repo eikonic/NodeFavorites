@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Node Favorites",
     "author": "eikonic",
-    "version": (1, 0, 0),
+    "version": (1, 1, 0),
     "blender": (4, 2, 0),
     "location": "Node Editors > Sidebar > Node Favorites",
     "description": "Editor window shelf for saving and recalling favorite single nodes, or groups of nodes.",
@@ -184,6 +184,8 @@ def _item_entry(i):
     if i.is_group:
         entry["preset"] = json.loads(i.preset)  # raises if broken; callers skip the item
         entry["description"] = i.description
+    elif i.custom_color:
+        entry["custom_color"] = True
     return entry
 
 
@@ -219,6 +221,7 @@ def build_data(p, nodes=True, groups=True, settings=True):
             "enabled": p.use_shortcuts,
             "group_modifier": p.group_modifier,
             "keys": list(_last_node_keys or (_kmi_cfg or {}).get("keys") or DEFAULT_KEYS),
+            "add_key": dict(_last_add_key or (_kmi_cfg or {}).get("add_key") or DEFAULT_ADD_KEY),
         },
     }
     if not settings:
@@ -334,6 +337,7 @@ def append_entries(p, entries, skip_existing):
             if is_group:
                 item.preset = json.dumps(preset)
                 item.description = str(e.get("description", ""))
+            item.custom_color = (not is_group) and bool(e.get("custom_color", False))
             try:
                 item.color = tuple(e.get("color", (0.5, 0.5, 0.5)))[:3]
             except Exception:
@@ -406,9 +410,16 @@ def load_from_disk(p):
 
 
 def _color_updated(self, context):
-    # Preset colors are user-chosen, so persist them when edited.
-    if self.is_group:
+    # Group colors and custom node colors are user-chosen, so persist them when edited.
+    if self.is_group or self.custom_color:
         save_to_disk()
+    elif not _loading and not _refreshing:
+        # A node swatch was edited directly: keep that color (Use Custom Color turns on).
+        self.custom_color = True
+
+
+def _custom_color_updated(self, context):
+    save_to_disk()
 
 
 def _editors_updated(self, context):
@@ -457,11 +468,15 @@ DEFAULT_KEYS = [
     "SIX", "SEVEN", "EIGHT", "NINE", "ZERO",
 ]
 KEY_NAMES = dict(zip(DEFAULT_KEYS, "1234567890"))
+ADD_KEY_OP_ID = "node_favorites.add_selected_key"
+DEFAULT_ADD_KEY = {"type": "A", "shift": 1, "ctrl": 1, "alt": 0}   # Ctrl+Shift+A
 
+_refreshing = False      # True while refresh_colors() writes theme colors
 _ready = False           # True once favorites are loaded (saving earlier could overwrite them)
 _kmi_cfg = None          # shortcut config read from disk at startup
 _last_node_keys = None   # last seen node-shortcut keys (to propagate to groups)
 _last_modifier = None    # last applied group modifier
+_last_add_key = None     # last seen Add Selected shortcut (type + modifiers)
 _saved_state = None      # last shortcut state written to disk
 _addon_keymaps = []      # (keymap, item) pairs we registered
 _slot_items_old = []     # keep replaced enum item lists alive (Blender holds the strings)
@@ -557,6 +572,23 @@ def user_slot_kmis():
     return out
 
 
+def user_add_kmi():
+    """The Add Selected Node(s) keymap item from the user keyconfig, or None."""
+    wm = bpy.context.window_manager
+    kc = wm.keyconfigs.user if wm else None
+    km = kc.keymaps.get("Node Editor") if kc else None
+    if km is None:
+        return None
+    for kmi in km.keymap_items:
+        if kmi.idname == ADD_KEY_OP_ID:
+            return kmi
+    return None
+
+
+def _kmi_key(kmi):
+    return {"type": kmi.type, "shift": int(kmi.shift), "ctrl": int(kmi.ctrl), "alt": int(kmi.alt)}
+
+
 def read_shortcut_config():
     try:
         with open(storage_path(), "r", encoding="utf-8") as f:
@@ -567,7 +599,10 @@ def read_shortcut_config():
 
 
 def shortcut_config_from(block):
-    cfg = {"enabled": True, "group_modifier": "SHIFT", "keys": list(DEFAULT_KEYS)}
+    cfg = {
+        "enabled": True, "group_modifier": "SHIFT", "keys": list(DEFAULT_KEYS),
+        "add_key": dict(DEFAULT_ADD_KEY),
+    }
     if not isinstance(block, dict):
         return cfg
     valid = {i.identifier for i in bpy.types.KeyMapItem.bl_rna.properties["type"].enum_items}
@@ -578,6 +613,14 @@ def shortcut_config_from(block):
     keys = block.get("keys")
     if isinstance(keys, list) and len(keys) == 10:
         cfg["keys"] = [k if k in valid else DEFAULT_KEYS[i] for i, k in enumerate(keys)]
+    ak = block.get("add_key")
+    if isinstance(ak, dict) and ak.get("type") in valid:
+        cfg["add_key"] = {
+            "type": ak["type"],
+            "shift": int(bool(ak.get("shift"))),
+            "ctrl": int(bool(ak.get("ctrl"))),
+            "alt": int(bool(ak.get("alt"))),
+        }
     return cfg
 
 
@@ -603,6 +646,12 @@ def register_keymaps(cfg):
             kmi.properties.slot = s
             kmi.properties.is_group = is_group
             _addon_keymaps.append((km, kmi))
+    ak = cfg["add_key"]
+    kmi = km.keymap_items.new(
+        ADD_KEY_OP_ID, type=ak["type"], value="PRESS",
+        shift=ak["shift"], ctrl=ak["ctrl"], alt=ak["alt"],
+    )
+    _addon_keymaps.append((km, kmi))
 
 
 def unregister_keymaps():
@@ -617,7 +666,7 @@ def unregister_keymaps():
 def _poll_shortcuts():
     """Runs every ~1.5s: keeps group keys in step with node keys, refreshes
     badge labels, and saves shortcut changes (wherever they were edited)."""
-    global _last_node_keys, _last_modifier, _saved_state
+    global _last_node_keys, _last_modifier, _saved_state, _last_add_key
     p = prefs()
     kmis = user_slot_kmis()
     if p is None or not kmis:
@@ -648,7 +697,13 @@ def _poll_shortcuts():
 
     _refresh_slot_labels(kmis)
 
-    state = (p.use_shortcuts, p.group_modifier, tuple(node_keys))
+    add_kmi = user_add_kmi()
+    _last_add_key = _kmi_key(add_kmi) if add_kmi is not None else dict(DEFAULT_ADD_KEY)
+
+    state = (
+        p.use_shortcuts, p.group_modifier, tuple(node_keys),
+        tuple(sorted(_last_add_key.items())),
+    )
     if _saved_state is None:
         _saved_state = state
     elif state != _saved_state:
@@ -676,6 +731,11 @@ def apply_imported_shortcuts(p, raw):
                     kmi = kmis.get((is_group, s))
                     if kmi is not None:
                         kmi.type = cfg["keys"][s - 1]
+        add_kmi = user_add_kmi()
+        if add_kmi is not None and isinstance(block.get("add_key"), dict):
+            ak = cfg["add_key"]
+            add_kmi.type = ak["type"]
+            add_kmi.shift, add_kmi.ctrl, add_kmi.alt = ak["shift"], ak["ctrl"], ak["alt"]
         _poll_shortcuts()
 
 
@@ -703,6 +763,8 @@ class NF_Item(PropertyGroup):
         min=0.0, max=1.0, default=(0.5, 0.5, 0.5),
         update=_color_updated,
     )
+    # Single nodes only: True = user-chosen color, not refreshed from the theme.
+    custom_color: BoolProperty(default=False, update=_custom_color_updated)
 
 
 # ------------------------------------------------------------------------
@@ -942,6 +1004,10 @@ class NF_Preferences(AddonPreferences):
                         row.prop(kmi, "type", text="", event=True)
                     else:
                         row.label(text="-")
+            box.label(text="Add Selected Node(s) Key:")
+            add_kmi = user_add_kmi()
+            if add_kmi is not None:
+                box.prop(add_kmi, "type", text="", full_event=True)
             box.label(text="Also editable under Keymap > Node Editor.")
 
         # Class order for "sort by class": one column per enabled editor, side by side
@@ -1237,18 +1303,23 @@ def node_theme_attr(node_id):
 
 
 def refresh_colors(context=None):
-    """Copy current theme node colors into each single-node favorite."""
+    """Copy current theme node colors into each single-node favorite (except custom-colored ones)."""
     context = context or bpy.context
     p = prefs(context)
     if p is None:
         return
+    global _refreshing
     theme = context.preferences.themes[0].node_editor
-    for item in p.items:
-        if item.is_group:
-            continue
-        c = getattr(theme, node_theme_attr(item.node_id), None)
-        if c is not None:
-            item.color = tuple(c)[:3]
+    _refreshing = True
+    try:
+        for item in p.items:
+            if item.is_group or item.custom_color:
+                continue
+            c = getattr(theme, node_theme_attr(item.node_id), None)
+            if c is not None:
+                item.color = tuple(c)[:3]
+    finally:
+        _refreshing = False
 
 
 # ------------------------------------------------------------------------
@@ -1641,6 +1712,60 @@ def insert_item(op, context, event, index):
     return {"FINISHED"}
 
 
+class NF_OT_EditNode(Operator):
+    """Edit this node's swatch color"""
+    bl_idname = "node_favorites.edit_node"
+    bl_label = "Edit Node Color"
+
+    index: IntProperty(default=-1, options={"HIDDEN"})
+    use_custom: BoolProperty(
+        name="Use Custom Color",
+        description="Use your own color; when off, the color follows the theme for this node's class",
+        default=False,
+    )
+    color: FloatVectorProperty(
+        name="Color", subtype="COLOR_GAMMA", size=3,
+        min=0.0, max=1.0, default=(0.5, 0.5, 0.5),
+    )
+
+    def _item(self, context):
+        p = prefs(context)
+        if p and 0 <= self.index < len(p.items) and not p.items[self.index].is_group:
+            return p.items[self.index]
+        return None
+
+    def invoke(self, context, event):
+        item = self._item(context)
+        if item is None:
+            return {"CANCELLED"}
+        self.use_custom = item.custom_color
+        self.color = item.color
+        return context.window_manager.invoke_props_dialog(self)
+
+    def draw(self, context):
+        layout = self.layout
+        item = self._item(context)
+        if item is not None:
+            layout.label(text=item_label(item))
+        layout.prop(self, "use_custom")
+        row = layout.row()
+        row.enabled = self.use_custom
+        row.prop(self, "color")
+
+    def execute(self, context):
+        item = self._item(context)
+        if item is None:
+            return {"CANCELLED"}
+        if self.use_custom:
+            item.custom_color = True
+            item.color = self.color
+        else:
+            item.custom_color = False
+            refresh_colors(context)
+        save_to_disk()
+        return {"FINISHED"}
+
+
 class NF_OT_Insert(Operator):
     """Add this node or group at the mouse and carry it until you click to drop it"""
     bl_idname = "node_favorites.insert"
@@ -1705,6 +1830,21 @@ class NF_OT_SlotInsert(Operator):
             ):
                 return insert_item(self, context, event, i)
         return {"PASS_THROUGH"}  # nothing assigned: let the key do whatever else it does
+
+
+class NF_OT_AddSelectedKey(Operator):
+    """Add the selected node(s) to the favorites (keyboard shortcut)"""
+    bl_idname = ADD_KEY_OP_ID
+    bl_label = "Node Favorites: Add Selected Node(s)"
+
+    @classmethod
+    def poll(cls, context):
+        p = prefs(context)
+        return bool(p and p.use_shortcuts and in_node_editor(context) and context.selected_nodes)
+
+    def execute(self, context):
+        bpy.ops.node_favorites.add_selected("INVOKE_DEFAULT")
+        return {"FINISHED"}
 
 
 class NF_OT_Remove(Operator):
@@ -1828,7 +1968,7 @@ class NF_OT_Sort(Operator):
                 "name": i.name, "preset": i.preset, "label": item_label(i),
                 "rank": category_rank(i, order), "color": tuple(i.color),
                 "slot": i.slot, "tree_type": i.tree_type,
-                "description": i.description,
+                "description": i.description, "custom_color": i.custom_color,
             }
             for i in p.items
         ]
@@ -1857,7 +1997,8 @@ class NF_OT_Sort(Operator):
                 item.name = r["name"]
                 item.preset = r["preset"]
                 item.description = r["description"]
-                item.color = r["color"]   # keeps user-chosen preset colors
+                item.custom_color = r["custom_color"]
+                item.color = r["color"]   # keeps user-chosen group and custom node colors
                 if active_key == (r["node_id"], r["settings"], r["name"], r["preset"]):
                     new_active = n
         p.active_index = new_active
@@ -2099,6 +2240,15 @@ class NF_UL_Base(UIList):
             )
             op.index = index
             gap_h(tail, ROW_GAP)
+        else:
+            op = tail.operator(
+                "node_favorites.edit_node",
+                text="",
+                icon="PREFERENCES",
+                emboss=False,
+            )
+            op.index = index
+            gap_h(tail, ROW_GAP)
 
         op = tail.operator(
             "node_favorites.remove",
@@ -2205,8 +2355,10 @@ classes = (
     NF_OT_SearchAdd,
     NF_OT_AddSelected,
     NF_OT_EditPreset,
+    NF_OT_EditNode,
     NF_OT_Insert,
     NF_OT_SlotInsert,
+    NF_OT_AddSelectedKey,
     NF_OT_Export,
     NF_OT_Import,
     NF_OT_CheckUpdate,
@@ -2282,11 +2434,11 @@ def register():
 
 def unregister():
     global _ready
-    global _kmi_cfg, _last_node_keys, _last_modifier, _saved_state
+    global _kmi_cfg, _last_node_keys, _last_modifier, _saved_state, _last_add_key
     _node_types_cache.clear()
     _enum_cache.clear()
     _ready = False
-    _kmi_cfg = _last_node_keys = _last_modifier = _saved_state = None
+    _kmi_cfg = _last_node_keys = _last_modifier = _saved_state = _last_add_key = None
     _update.update(state="idle", latest="", url="")
     for fn in (_seed_defaults, _poll_shortcuts, _redraw_when_done):
         if bpy.app.timers.is_registered(fn):
