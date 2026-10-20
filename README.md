@@ -30,7 +30,7 @@ Blender 4.2 or newer.
 ## Usage
 Open a node editor, press `N` to show the sidebar, and open the **Node Favorites** tab.
 
-- To add a node: select it and click **Add Selected Node(s)**.
+- To add a node: select it and click **Add Selected Node(s)**. CTRL+SHIFT+A is the default shortcut.
 - To add a group of nodes: select several nodes and click **Add Selected Node(s)**, then fill in the dialog.
 - To use a favorite: click it, move the mouse to where you want it, and click to drop it.
 
